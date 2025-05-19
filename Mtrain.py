@@ -49,7 +49,7 @@ def split_data_by_label(X, y, test_size=0.2):
     return np.array(X_train), np.array(y_train), np.array(X_val), np.array(y_val)
 
 def main():
-    file_path = '/home/wei/fenlei2/data/training/v1.json'
+    file_path = '输入训练样本json路径'
     processed_data, encoded_labels, le, encoders, imputer, scaler = preprocess_data(file_path)
     if processed_data is None:
         return
