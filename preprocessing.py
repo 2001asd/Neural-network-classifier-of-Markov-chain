@@ -1,3 +1,4 @@
+#此脚本为数据预处理脚本，以便将数据变为神经网络方便处理的数据，并能自动检测缺失字段，运行训练脚本时不符合train.json的文件将被提示，“工单状态”在预测脚本预处理时可以缺失。
 import json
 import numpy as np
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder
