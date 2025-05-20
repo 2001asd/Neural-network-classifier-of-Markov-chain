@@ -1,3 +1,5 @@
+##此脚本为训练模型脚本，输入样本需要参考train.json的格式 输出即为训练模型的效果和保持模型路径
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
