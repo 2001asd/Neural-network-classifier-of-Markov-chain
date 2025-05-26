@@ -1,0 +1,510 @@
+import cv2
+import os
+import numpy as np
+from pathlib import Path
+import json
+import time
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+# Configuration
+VIDEO_DIR = "/home/wei/Tesila/MPN-main/date1/necessary"      # Input video directory
+CURVE_PATH = "/home/wei/Tesila1/red_line_points.json"  # Reference curve JSON path
+OUTPUT_ROOT = "/home/wei/Tesila1/output5"    # Output directory
+
+# Algorithm parameters
+THRESHOLD = 20          # Binarization threshold
+MIN_AREA = 500           # Minimum object area for filtering noise
+IOU_THRESHOLD = 0.1      # IOU threshold for object matching
+DIST_CHANGE_THRESH = 1   # Distance change threshold (pixels)
+VERBOSE = True           # Enable detailed logging
+
+# Necessary frame parameters
+POSSIBLE_AREA_THRESH = 1750  # Threshold for possible necessary frames
+# Necessary frame condition 1: Close to trend + area>4000 + distance<120
+NECESSARY_AREA_THRESH = 1750 
+NECESSARY_DIST_THRESH = 100
+# Necessary frame condition 2: Area>15000 + distance<240 (no need to be close to trend)
+ALTERNATE_AREA_THRESH = 17000 
+ALTERNATE_DIST_THRESH = 240  
+
+# Supported video extensions
+VIDEO_EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv']
+
+
+def load_curve(json_path):
+    """Load reference curve coordinates"""
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"Reference curve file not found: {json_path}")
+    with open(json_path, 'r') as f:
+        return np.array(json.load(f), dtype=np.float32)
+
+
+def get_min_distance(obj_contour, curve_points):
+    """Calculate the minimum distance from object contour to reference curve"""
+    if len(curve_points) == 0 or len(obj_contour) == 0:
+        return 0.0
+    obj_points = obj_contour.reshape(-1, 2)
+    distances = np.sqrt(np.sum((curve_points - obj_points[:, None])**2, axis=2))
+    return np.min(distances) if len(distances) > 0 else 0.0
+
+
+def calculate_iou(box1, box2):
+    """Calculate IoU between two bounding boxes"""
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    x_left = max(x1, x2)
+    y_top = max(y1, y2)
+    x_right = min(x1 + w1, x2 + w2)
+    y_bottom = min(y1 + h1, y2 + h2)
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    union_area = w1 * h1 + w2 * h2 - intersection_area
+    return intersection_area / union_area if union_area != 0 else 0.0
+
+
+def match_objects(prev_objects, current_objects, iou_threshold=0.3):
+    """Match objects between consecutive frames based on IoU"""
+    matches = {}
+    if not prev_objects or not current_objects:
+        return matches
+    iou_matrix = np.zeros((len(current_objects), len(prev_objects)))
+    for i, curr_obj in enumerate(current_objects):
+        for j, prev_obj in enumerate(prev_objects):
+            iou = calculate_iou(curr_obj['bbox'], prev_obj['bbox'])
+            if iou >= iou_threshold:
+                iou_matrix[i, j] = iou
+    for i in range(len(current_objects)):
+        if np.max(iou_matrix[i]) >= iou_threshold:
+            j = np.argmax(iou_matrix[i])
+            matches[i] = j
+            iou_matrix[:, j] = 0
+    return matches
+
+
+def visualize_objects(frame, curve_points, objects, frame_id, is_possible, is_necessary):
+    """Visualize detection results"""
+    viz_frame = frame.copy()
+    # Draw reference curve
+    if len(curve_points) > 1:
+        curve_points = curve_points.astype(np.int32)
+        cv2.polylines(viz_frame, [curve_points], False, (0, 0, 255), 2)
+    # Draw object bounding boxes
+    for i, obj in enumerate(objects):
+        x, y, w, h = obj['bbox']
+        area = obj['area']
+        distance = obj['distance']
+        # Select color based on frame status
+        if is_possible:
+            color = (0, 255, 255)  # Yellow: Possible necessary frame
+        elif is_necessary:
+            color = (0, 0, 255)    # Red: Necessary frame
+        else:
+            color = (255, 255, 255)  # White: Normal frame
+        cv2.rectangle(viz_frame, (x, y), (x+w, y+h), color, 2)
+        # Draw object ID, area, and distance
+        text = f"ID:{i} A:{area} D:{distance:.1f}"
+        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(viz_frame, (x, y-20), (x+text_w, y), color, -1)
+        cv2.putText(viz_frame, text, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    # Draw frame status text
+    status_text = "Necessary" if is_necessary else "Non-necessary"
+    if is_possible and not is_necessary:
+        status_text = f"Possible {status_text}"
+    text_color = (0, 0, 255) if is_necessary else (0, 255, 0)
+    cv2.putText(viz_frame, f"Frame: {frame_id} | Status: {status_text}", 
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+    return viz_frame
+
+
+def process_video(video_path, video_name, ground_truth):
+    """Process a single video and return evaluation data"""
+    print(f"\nProcessing video: {video_name} | Ground truth: {'Necessary' if ground_truth else 'Non-necessary'}")
+    video_output_root = os.path.join(OUTPUT_ROOT, video_name)
+    Path(video_output_root).mkdir(parents=True, exist_ok=True)
+    viz_output_dir = os.path.join(video_output_root, "visualizations")
+    Path(viz_output_dir).mkdir(parents=True, exist_ok=True)
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Warning: Cannot open video {video_path}, skipping...")
+        return {
+            "name": video_name,
+            "ground_truth": ground_truth,
+            "prediction": False,
+            "possible_frames": 0,
+            "necessary_frames": 0,
+            "processed_frames": 0,
+            "total_original_frames": 0,
+            "frame_labels": []
+        }
+    
+    original_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    curve_points = load_curve(CURVE_PATH)
+    
+    prev_gray = None
+    prev_frame_objects = []
+    frame_labels = []          # Final frame labels (0: Non-necessary, 1: Necessary)
+    possible_frame_flags = []  # Possible necessary frame flags
+    necessary_frame_count = 0  # Necessary frame count
+    possible_frame_count = 0   # Possible necessary frame count
+    has_necessary_frame = False  # Whether the video contains necessary frames
+    processed_frame_count = 0  # Processed frame count
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_idx += 1
+        # Ensure consistent video dimensions
+        if frame_idx == 1:
+            ref_height, ref_width = frame.shape[:2]
+        else:
+            if frame.shape[0] != ref_height or frame.shape[1] != ref_width:
+                frame = cv2.resize(frame, (ref_width, ref_height))
+        current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        current_gray = cv2.GaussianBlur(current_gray, (5, 5), 0)
+
+        # Process every 5th frame
+        if (frame_idx - 1) % 5 != 0:
+            continue
+        processed_frame_count += 1
+
+        if prev_gray is None:
+            prev_gray = current_gray.copy()
+            frame_labels.append(0)
+            possible_frame_flags.append(False)
+            # Save visualization of the first frame
+            viz_frame = visualize_objects(frame, curve_points, [], frame_idx, False, False)
+            viz_path = os.path.join(viz_output_dir, f"frame_{frame_idx:06d}.jpg")
+            cv2.imwrite(viz_path, viz_frame)
+            continue
+
+        # Frame difference method
+        frame_diff = cv2.absdiff(prev_gray, current_gray)
+        _, thresh = cv2.threshold(frame_diff, THRESHOLD, 255, cv2.THRESH_BINARY)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+        # Contour detection
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        current_frame_objects = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < MIN_AREA:
+                continue
+            bbox = cv2.boundingRect(contour)
+            min_distance = get_min_distance(contour, curve_points)
+            current_frame_objects.append({
+                'contour': contour,
+                'bbox': bbox,
+                'distance': min_distance,
+                'area': int(area)
+            })
+        
+        # Object matching
+        object_matches = match_objects(prev_frame_objects, current_frame_objects, IOU_THRESHOLD)
+        frame_has_possible = False
+        frame_has_necessary = False
+
+        for i, obj in enumerate(current_frame_objects):
+            trend = 0
+            if i in object_matches:
+                j = object_matches[i]
+                prev_distance = prev_frame_objects[j]['distance']
+                current_distance = obj['distance']
+                # Calculate movement trend (approaching/leaving)
+                if current_distance < prev_distance - DIST_CHANGE_THRESH:
+                    trend = 1  # Approaching
+                elif current_distance > prev_distance + DIST_CHANGE_THRESH:
+                    trend = 2  # Leaving
+            # Determine possible necessary frame: approaching trend + area > threshold
+            if trend == 1 and obj['area'] > POSSIBLE_AREA_THRESH:
+                frame_has_possible = True
+            # Determine necessary frame: meets condition 1 or condition 2
+            if (trend == 1 and obj['area'] > NECESSARY_AREA_THRESH and obj['distance'] < NECESSARY_DIST_THRESH) or \
+               (obj['area'] > ALTERNATE_AREA_THRESH and obj['distance'] < ALTERNATE_DIST_THRESH):
+                frame_has_necessary = True
+        
+        # Record frame status
+        possible_frame_flags.append(frame_has_possible)
+        if frame_has_possible:
+            possible_frame_count += 1
+        frame_labels.append(1 if frame_has_necessary else 0)
+        if frame_has_necessary:
+            necessary_frame_count += 1
+            has_necessary_frame = True
+        
+        # Save visualization results
+        viz_frame = visualize_objects(frame, curve_points, current_frame_objects, frame_idx, 
+                                      frame_has_possible, frame_has_necessary)
+        viz_path = os.path.join(viz_output_dir, f"frame_{frame_idx:06d}.jpg")
+        cv2.imwrite(viz_path, viz_frame)
+        
+        # Log output
+        if VERBOSE:
+            obj_count = len(current_frame_objects)
+            possible_flag = "Yes" if frame_has_possible else "No"
+            necessary_flag = "Yes" if frame_has_necessary else "No"
+            print(f"Processing frame {frame_idx:06d} | Necessary: {necessary_flag} | Possible: {possible_flag} | Objects: {obj_count}")
+    
+        prev_gray = current_gray.copy()
+        prev_frame_objects = current_frame_objects
+
+    cap.release()
+    
+    # Video-level prediction: If any frame is necessary, the video is necessary
+    video_is_necessary = has_necessary_frame
+    # Upgrade possible necessary frames: If the video is necessary, all possible frames become necessary
+    if video_is_necessary:
+        for i, is_possible in enumerate(possible_frame_flags):
+            if is_possible and frame_labels[i] == 0:
+                frame_labels[i] = 1
+                necessary_frame_count += 1
+    
+    result = {
+        "name": video_name,
+        "ground_truth": ground_truth,
+        "prediction": video_is_necessary,
+        "possible_frames": possible_frame_count,
+        "necessary_frames": necessary_frame_count,
+        "processed_frames": processed_frame_count,
+        "total_original_frames": original_total_frames,
+        "frame_labels": frame_labels
+    }
+    
+    print(f"- Prediction: {'Necessary' if video_is_necessary else 'Non-necessary'}")
+    print(f"- Total original frames: {original_total_frames}")
+    print(f"- Processed frames: {processed_frame_count}")
+    print(f"- Possible necessary frames: {possible_frame_count}/{processed_frame_count}")
+    print(f"- Necessary frames: {necessary_frame_count}/{processed_frame_count}")
+    
+    # Save frame-level results to text file
+    results_txt = os.path.join(video_output_root, "frame_results.txt")
+    with open(results_txt, 'w') as f:
+        f.write(f"Video: {video_name}\n")
+        f.write(f"Ground truth: {'Necessary' if ground_truth else 'Non-necessary'}\n")
+        f.write(f"Prediction: {'Necessary' if video_is_necessary else 'Non-necessary'}\n\n")
+        f.write("Frame results:\n")
+        f.write("Frame Index\tNecessary Flag\n")
+        for i, is_necessary in enumerate(frame_labels):
+            original_frame_idx = (i * 5) + 1  # Convert to original video frame index
+            f.write(f"{original_frame_idx}\t\t{is_necessary}\n")
+    
+    return result
+
+
+def plot_frame_level_comparison(video_results):
+    """Plot frame-level label comparison"""
+    def sort_key(result):
+        name = result["name"]
+        return (0, int(name)) if name.isdigit() else (1, name)
+    video_results = sorted(video_results, key=sort_key)
+    
+    all_true_labels = []
+    all_pred_labels = []
+    all_frame_indices = []
+    
+    for result in video_results:
+        processed_frames = result["processed_frames"]
+        true_labels = [1 if result["ground_truth"] else 0] * processed_frames
+        pred_labels = result["frame_labels"]
+        all_true_labels.extend(true_labels)
+        all_pred_labels.extend(pred_labels)
+        start_idx = sum(res["processed_frames"] for res in video_results[:video_results.index(result)])
+        all_frame_indices.extend(range(start_idx + 1, start_idx + processed_frames + 1))
+    
+    frame_accuracy = sum(t == p for t, p in zip(all_true_labels, all_pred_labels)) / len(all_true_labels) if len(all_true_labels) > 0 else 0
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(all_frame_indices, all_true_labels, 'r-', alpha=0.7, label='Ground Truth')
+    plt.plot(all_frame_indices, all_pred_labels, 'b-', alpha=0.7, label='Algorithm Prediction')
+    plt.axhline(y=0.5, color='k', linestyle='--', alpha=0.3)
+    plt.xlabel('Processed Frame Index')
+    plt.ylabel('Label (1: Necessary, 0: Non-necessary)')
+    plt.title(f'Frame-Level Label Comparison (Accuracy: {frame_accuracy:.2%})')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plot_path = os.path.join(OUTPUT_ROOT, "frame_level_comparison.png")
+    plt.savefig(plot_path)
+    print(f"\nFrame-level comparison plot saved to: {plot_path}")
+    plt.close()
+
+
+def plot_video_level_comparison(video_results):
+    """Plot video-level label comparison"""
+    def sort_key(result):
+        name = result["name"]
+        return (0, int(name)) if name.isdigit() else (1, name)
+    video_results = sorted(video_results, key=sort_key)
+    
+    video_names = [result["name"] for result in video_results]
+    true_labels = [1 if result["ground_truth"] else 0 for result in video_results]
+    pred_labels = [1 if result["prediction"] else 0 for result in video_results]
+    
+    # Calculate video-level accuracy
+    correct_videos = sum(1 for t, p in zip(true_labels, pred_labels) if t == p)
+    video_accuracy = correct_videos / len(video_results) if len(video_results) > 0 else 0
+    
+    # Plot bar chart
+    plt.figure(figsize=(14, 6))
+    x = np.arange(len(video_names))
+    width = 0.35
+    
+    plt.bar(x - width/2, true_labels, width, label='Ground Truth', color='red', alpha=0.7)
+    plt.bar(x + width/2, pred_labels, width, label='Algorithm Prediction', color='blue', alpha=0.7)
+    
+    plt.axhline(y=0.5, color='k', linestyle='--', alpha=0.3)
+    plt.xticks(x, video_names, rotation=45, ha='right')
+    plt.ylabel('Label (1: Necessary, 0: Non-necessary)')
+    plt.title(f'Video-Level Label Comparison (Accuracy: {video_accuracy:.2%})')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # Save chart
+    plot_path = os.path.join(OUTPUT_ROOT, "video_level_comparison.png")
+    plt.savefig(plot_path)
+    print(f"\nVideo-level comparison plot saved to: {plot_path}")
+    plt.close()
+
+
+def plot_video_based_frame_comparison(video_results):
+    """Plot frame-level comparison based on video-level prediction
+       (If a video is predicted as necessary, all its frames are considered necessary)"""
+    def sort_key(result):
+        name = result["name"]
+        return (0, int(name)) if name.isdigit() else (1, name)
+    video_results = sorted(video_results, key=sort_key)
+    
+    all_true_labels = []
+    all_pred_labels = []
+    all_frame_indices = []
+    
+    for result in video_results:
+        processed_frames = result["processed_frames"]
+        true_labels = [1 if result["ground_truth"] else 0] * processed_frames
+        # Video-level prediction applied to all frames
+        pred_labels = [1 if result["prediction"] else 0] * processed_frames
+        all_true_labels.extend(true_labels)
+        all_pred_labels.extend(pred_labels)
+        start_idx = sum(res["processed_frames"] for res in video_results[:video_results.index(result)])
+        all_frame_indices.extend(range(start_idx + 1, start_idx + processed_frames + 1))
+    
+    frame_accuracy = sum(t == p for t, p in zip(all_true_labels, all_pred_labels)) / len(all_true_labels) if len(all_true_labels) > 0 else 0
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(all_frame_indices, all_true_labels, 'r-', alpha=0.7, label='Ground Truth')
+    plt.plot(all_frame_indices, all_pred_labels, 'g-', alpha=0.7, label='Video-Level Based Prediction')
+    plt.axhline(y=0.5, color='k', linestyle='--', alpha=0.3)
+    plt.xlabel('Processed Frame Index')
+    plt.ylabel('Label (1: Necessary, 0: Non-necessary)')
+    plt.title(f'Video-Level Based Frame Label Comparison (Accuracy: {frame_accuracy:.2%})')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plot_path = os.path.join(OUTPUT_ROOT, "video_based_frame_comparison.png")
+    plt.savefig(plot_path)
+    print(f"\nVideo-level based frame comparison plot saved to: {plot_path}")
+    plt.close()
+
+
+def calculate_accuracy(video_results):
+    """Calculate video-level and frame-level accuracy"""
+    video_correct = 0
+    total_videos = len(video_results)
+    
+    frame_correct = 0
+    total_frames = 0
+    
+    for result in video_results:
+        # Video-level accuracy
+        if result["ground_truth"] == result["prediction"]:
+            video_correct += 1
+        
+        # Frame-level accuracy
+        true_labels = [1 if result["ground_truth"] else 0] * result["processed_frames"]
+        pred_labels = result["frame_labels"]
+        
+        frame_correct += sum(1 for t, p in zip(true_labels, pred_labels) if t == p)
+        total_frames += result["processed_frames"]
+    
+    video_accuracy = video_correct / total_videos if total_videos > 0 else 0
+    frame_accuracy = frame_correct / total_frames if total_frames > 0 else 0
+    
+    print(f"\n=== Accuracy Evaluation ===")
+    print(f"Video-level accuracy: {video_accuracy:.2%} ({video_correct}/{total_videos})")
+    print(f"Frame-level accuracy: {frame_accuracy:.2%} ({frame_correct}/{total_frames})")
+    
+    # Save evaluation results
+    eval_path = os.path.join(OUTPUT_ROOT, "accuracy_evaluation.txt")
+    with open(eval_path, 'w') as f:
+        f.write(f"Video-level accuracy: {video_accuracy:.2%} ({video_correct}/{total_videos})\n")
+        f.write(f"Frame-level accuracy: {frame_accuracy:.2%} ({frame_correct}/{total_frames})\n")
+        f.write("\nDetailed results:\n")
+        for result in video_results:
+            f.write(f"Video: {result['name']}\n")
+            f.write(f"  Ground Truth: {'Necessary' if result['ground_truth'] else 'Non-necessary'}\n")
+            f.write(f"  Prediction: {'Necessary' if result['prediction'] else 'Non-necessary'}\n")
+            f.write(f"  Possible Necessary Frames: {result['possible_frames']}/{result['processed_frames']}\n")
+            f.write(f"  Necessary Frames: {result['necessary_frames']}/{result['processed_frames']}\n")
+
+
+def main():
+    """Main function: Process all videos in the directory"""
+    Path(OUTPUT_ROOT).mkdir(parents=True, exist_ok=True)
+    
+    video_files = []
+    for entry in os.scandir(VIDEO_DIR):
+        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in VIDEO_EXTENSIONS:
+            video_files.append(entry.path)
+    
+    if not video_files:
+        print(f"Error: No video files found in {VIDEO_DIR}")
+        return
+    
+    # Custom sorting function: Videos with numeric names first
+    def sort_key(path):
+        name = os.path.splitext(os.path.basename(path))[0]
+        return (0, int(name)) if name.isdigit() else (1, name)
+    
+    video_files.sort(key=sort_key)
+    
+    print(f"Found {len(video_files)} video files:")
+    for i, video_path in enumerate(video_files):
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        ground_truth = video_name.isdigit()  # Videos with numeric names are labeled as necessary
+        print(f"{i+1}. {video_name} ({'Necessary' if ground_truth else 'Non-necessary'})")
+    
+    video_results = []
+    for video_path in video_files:
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        ground_truth = video_name.isdigit()  # Videos with numeric names are labeled as necessary
+        result = process_video(video_path, video_name, ground_truth)
+        video_results.append(result)
+    
+    # Plot frame-level comparison
+    plot_frame_level_comparison(video_results)
+    
+    # Plot video-level comparison
+    plot_video_level_comparison(video_results)
+    
+    # Plot video-based frame comparison
+    plot_video_based_frame_comparison(video_results)
+    
+    # Calculate accuracy
+    calculate_accuracy(video_results)
+    
+    print(f"\nAll videos processed! Results summary:")
+    print(f"- Frame-level comparison plot: {os.path.join(OUTPUT_ROOT, 'frame_level_comparison.png')}")
+    print(f"- Video-level comparison plot: {os.path.join(OUTPUT_ROOT, 'video_level_comparison.png')}")
+    print(f"- Video-level based frame comparison plot: {os.path.join(OUTPUT_ROOT, 'video_based_frame_comparison.png')}")
+    print(f"- Accuracy evaluation: {os.path.join(OUTPUT_ROOT, 'accuracy_evaluation.txt')}")
+    print(f"- Frame results for each video are saved in their respective directories")
+    print(f"- Visualizations with bounding boxes are saved in the 'visualizations' subdirectory of each video")
+
+
+if __name__ == "__main__":
+    main()    
